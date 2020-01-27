@@ -1,0 +1,404 @@
+package com.csl.maillistener;
+
+import java.util.*;
+import java.io.*;
+import javax.mail.*;
+import javax.mail.event.*;
+import javax.mail.internet.MimeBodyPart;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.sun.mail.iap.ProtocolException;
+import com.sun.mail.imap.IMAPFolder;
+import com.sun.mail.imap.protocol.IMAPProtocol;
+import org.apache.log4j.BasicConfigurator;
+import org.apache.log4j.LogManager;
+import org.apache.log4j.Logger;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.usermodel.Row.MissingCellPolicy;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+
+public class App {
+
+  private static final Logger logger = LogManager.getLogger(App.class);
+
+  public static void main(String[] args) {
+
+    BasicConfigurator.configure();
+
+    System.out.println("Starting EmailListener....");
+    System.out.println("Recepient Email Id: " + Utils.getEnv("email_recepient_id"));
+    System.out.println();
+    System.out.println();
+
+    try {
+      Properties props = System.getProperties();
+      Session session = Session.getInstance(props, null);
+      Store store = session.getStore("imap");
+      store.connect(Utils.getEnv("email_host"), Utils.getEnv("email_recepient_id"),
+          Utils.getEnv("email_recepient_password"));
+      IMAPFolder folder = (IMAPFolder) store.getFolder("inbox");
+      if (folder == null || !folder.exists()) {
+        logger.debug("Invalid folder");
+        System.exit(1);
+      }
+      folder.open(Folder.READ_ONLY);
+
+      MessageCountListener messageCountListener = new MessageCountAdapter() {
+        public void messagesAdded(MessageCountEvent ev) {
+          System.out.println();
+          logger.info("Inside  messagesAdded.");
+          Message[] msgs = ev.getMessages();
+          logger.info("Got " + msgs.length + " new messages");
+
+
+          int cnt = 1;
+          for (int i = 0; i < msgs.length; i++) {
+            cnt++;
+            Message currMessage = msgs[i];
+            String attachFiles = null;
+            String messageContent = null;
+            try {
+              System.out.println();
+              logger.info("Content-Type:" + currMessage.getContentType());
+              logger.info("Content:" + currMessage.getContent().toString());
+
+              String subject = currMessage.getSubject().toString();
+              logger.info("Subject:" + subject);
+
+              // Email From
+              String emailFrom = currMessage.getFrom()[i].toString();
+              logger.info("Email Received From : " + emailFrom);
+
+              // File Upload system
+              OpsFile opsFile = OpsFile.getFileSystem(Utils.getEnv("file_system"));
+              logger.info("File Upload System : " + opsFile);
+
+              String msgId = currMessage.getAllHeaders().toString();
+              logger.info("All Headers : " + msgId);
+
+
+              //
+              if ((subject.substring(0, 37).contains("Re: Technical Verification initiation"))
+                  || (subject.substring(0, 36).contains("Re: Property Verification initiation"))
+                  || (subject.substring(0, 33).contains("Re: Legal Verification initiation"))) {
+
+                // If it is Excell & verificationForm
+                InputStream verificationformInputStream = null;
+                String verificationFormLoanApplicationNumber = "";
+                String verificationFormVerificationType = "";
+                MimeBodyPart excellPart = null;
+                ArrayNode typesAndSources = new ObjectMapper().createArrayNode();
+
+
+                if (currMessage.getContentType().contains("multipart")) {
+                  Multipart multiPart = (Multipart) currMessage.getContent();
+                  int numberOfParts = multiPart.getCount();
+                  logger.info("Number of Parts:" + numberOfParts);
+
+
+                  String excellSavedpath = "";
+                  String types = "";
+
+                  // First for loop to get the excell first
+                  for (int partCount = 0; partCount < numberOfParts; partCount++) {
+                    System.out.println();
+                    logger.info("**********INSIDE FIRST FOR LOOP***********");
+                    logger.info("Checking Verification Form");
+
+                    MimeBodyPart part = (MimeBodyPart) multiPart.getBodyPart(partCount);
+                    logger.info("Part Dispostion:" + part.getDisposition());
+
+                    if (Part.ATTACHMENT.equalsIgnoreCase(part.getDisposition())) {
+                      logger.info("File Name :  " + part.getFileName());
+
+                      String extension =
+                          part.getFileName().substring(part.getFileName().lastIndexOf(".") + 1);
+                      logger.info("Extension : " + extension);
+                      String fileName = part.getFileName().substring(0,
+                          part.getFileName().length() - (extension.length() + 1));
+
+                      int firstSpace = fileName.indexOf(" ");
+                      int lastSpace = fileName.lastIndexOf(" ");
+
+                      int cut = 0;
+                      if (lastSpace > 0) {
+                        cut = lastSpace;
+                      }
+
+                      String typeOfVerification = fileName.substring(0, cut).toString();
+                      logger.info("Type Of Verification : " + typeOfVerification);
+
+                      if (extension.contains("xlsx")
+                          && typeOfVerification
+                              .contains(Utils.getEnv("config_technical_verification_form"))
+                          || typeOfVerification
+                              .contains(Utils.getEnv("config_property_verification_form"))
+                          || typeOfVerification
+                              .contains(Utils.getEnv("config_legal_verification_form"))) {
+
+                        // if it is excell and verification form as well
+                        verificationformInputStream = part.getDataHandler().getInputStream();
+                        excellPart = part;
+                        verificationFormLoanApplicationNumber = fileName.substring((lastSpace + 1));
+                        verificationFormVerificationType =
+                            fileName.substring(0, firstSpace).toString();
+
+                        // saving excell to s3/loaclFileSystem
+                        excellSavedpath = opsFile.write(Utils.getEnv("base_directory"),
+                            Utils.getEnv("base_folder"), verificationFormLoanApplicationNumber,
+                            verificationFormVerificationType, extension, part.getFileName(),
+                            excellPart.getDataHandler().getInputStream());
+                        logger.info("File Saved Path: " + excellSavedpath);
+                        if (types.length() == 0) {
+                          types = types + "Documents";
+                        }
+
+                        JsonNode excellJson = new ObjectMapper().createObjectNode();
+                        ((ObjectNode) excellJson).put("type", types);
+                        ((ObjectNode) excellJson).put("sources", excellSavedpath);
+
+                        typesAndSources.add(excellJson);
+
+                      }
+                    } else {
+                      messageContent = part.getContent().toString();
+                    }
+                  }
+
+                  System.out.println();
+                  System.out.println();
+
+                  // Second for loop for Other Media including other excell
+                  for (int partCount = 0; partCount < numberOfParts; partCount++) {
+                    logger.info("**********INSIDE SECOND FOR LOOP***********");
+                    logger.info("Checking Other Media..");
+
+                    MimeBodyPart part = (MimeBodyPart) multiPart.getBodyPart(partCount);
+                    logger.info("Part Dispostion:" + part.getDisposition());
+
+                    if (Part.ATTACHMENT.equalsIgnoreCase(part.getDisposition())) {
+                      logger.info("File Name : " + part.getFileName());
+
+                      String extension =
+                          part.getFileName().substring(part.getFileName().lastIndexOf(".") + 1);
+                      logger.info("Extension : " + extension);
+                      String fileName = part.getFileName().substring(0,
+                          part.getFileName().length() - (extension.length() + 1));
+
+                      int firstSpace = fileName.indexOf(" ");
+                      int cut = 0;
+                      if (firstSpace > 0) {
+                        cut = firstSpace;
+                      }
+
+                      String typeOfVerification = fileName.substring(0, cut).toString();
+                      logger.info("Type of Verification: " + typeOfVerification);
+
+                      List<String> videosList = Arrays.asList("mp4", "m4a", "m4v", "f4v", "f4a",
+                          "m4b", "m4r", "f4b", "mov", "3gp", "3gp2", "3g2", "3gpp", "3gpp2", "ogg",
+                          "oga", "ogv", "ogx", "wmv", "wma", "asf", "webm", "flv", "mpeg", "wav",
+                          "mpeg-2", "mpeg-3", "mpeg-4", "hdv", "m4p", "mpg", "mpe", "mpg", "mp2",
+                          "mpv", "qt", "swf", "avchd");
+
+                      List<String> imageList = Arrays.asList("png", "pcd", "jpx", "jpg",
+                          "tif", "j2k", "jif", "tiff", "gif", "jfif", "j2c", "fpx", "jpeg", "jp2");
+
+                      if (!(extension.contains("xlsx")
+                          && typeOfVerification
+                              .contains(Utils.getEnv("config_technical_verification_form"))
+                          || typeOfVerification
+                              .contains(Utils.getEnv("config_property_verification_form"))
+                          || typeOfVerification
+                              .contains(Utils.getEnv("config_legal_verification_form")))) {
+
+                        // saving excell to s3/loaclFileSystem
+                        if (videosList.contains(extension) || (imageList.contains(extension))) {
+
+                          String fileSavedpath = opsFile.write(Utils.getEnv("base_directory"),
+                              Utils.getEnv("base_folder"), verificationFormLoanApplicationNumber,
+                              verificationFormVerificationType, extension, part.getFileName(),
+                              part.getDataHandler().getInputStream());
+                          System.out.println("File Saved Path :" + fileSavedpath);
+
+
+                          String mediaTypes = "";
+                          if (!(types.length() > 18)) {
+                            if (videosList.contains(extension)) {
+                              mediaTypes = "Video";
+                            } else if (imageList.contains(extension)) {
+                              mediaTypes = "Image";
+                            }
+                          }
+                          JsonNode mediaJson = new ObjectMapper().createObjectNode();
+                          ((ObjectNode) mediaJson).put("type", mediaTypes);
+                          ((ObjectNode) mediaJson).put("sources", fileSavedpath);
+
+                          typesAndSources.add(mediaJson);
+
+                        }
+                      }
+                    } else {
+                      messageContent = part.getContent().toString();
+                    }
+                  }
+
+                  /*
+                   * Both for loop ends here so now we are good to call store data and pass
+                   * verification form information to parse data along with media type and source
+                   * path to send to ops backend to store information in the database
+                   */
+
+
+                  // Call storeData method to parse excelll and send to ops
+                  storeData(verificationformInputStream, verificationFormVerificationType,
+                      verificationFormLoanApplicationNumber, emailFrom, typesAndSources);
+
+                  System.out.println();
+                  logger.info("Excell Parsing Completed and sent to Ops Backend !!!");
+                  logger.info("Testing 2...");
+                }
+              } else {
+                System.out.println();
+                logger.debug("New Message Received from Agency: " + emailFrom
+                    + " Reply Only from Sent Verification Initiation Request Expected !!");
+                // Write Some Code to Send Msg to Ops Person and the Agency that Only Reply should
+                // be sent and not a new msg
+
+
+              }
+            } catch (MessagingException e) {
+              e.printStackTrace();
+            } catch (IOException e) {
+              e.printStackTrace();
+            }
+          }
+        }
+      };
+      folder.addMessageCountListener(messageCountListener);
+      int freq = Integer.parseInt("1000");
+      // Check mail once in "freq" MILLIseconds
+      boolean supportsIdle = false;
+      try {
+        if (folder instanceof IMAPFolder) {
+          logger.info("Checking folder...");
+          IMAPFolder f = (IMAPFolder) folder;
+          if (!folder.isOpen()) {
+            folder.open(Folder.READ_ONLY);
+          }
+          f.idle();
+          supportsIdle = true;
+        }
+      } catch (FolderClosedException fex) {
+        supportsIdle = true;
+      } catch (MessagingException mex) {
+        supportsIdle = false;
+      }
+      logger.info("Outside try n catch...");
+
+      for (;;) {
+        if (supportsIdle && folder instanceof IMAPFolder) {
+          logger.info("For Loop Checking folder...");
+
+          IMAPFolder f = (IMAPFolder) folder;
+          if (!folder.isOpen()) {
+            folder.open(Folder.READ_ONLY);
+          }
+          try {
+            f.idle();
+          } catch (FolderClosedException fex) {
+            System.err.println("Floder Closed Exception...");
+            supportsIdle = true;
+          } catch (MessagingException mex) {
+            System.err.println("MessagingException...");
+            supportsIdle = true;
+            Thread.sleep(1000);
+          }
+          System.out.println("IDLE done");
+        } else {
+          Thread.sleep(freq); // sleep for freq milliseconds
+          // This is to force the IMAP server to send us
+          // EXISTS notifications.
+          folder.getMessageCount();
+        }
+      }
+
+    } catch (Exception ex) {
+      ex.printStackTrace();
+    }
+  }
+
+
+
+  /**
+   * 
+   * @param inputStream
+   * @throws IOException
+   */
+  private static void storeData(InputStream inputStream, String verificationFormType,
+      String loanApplicationNumber, String emailFrom, ArrayNode typesAndSources)
+      throws IOException {
+
+    System.out.println();
+    logger.info("Entering storeData .......");
+    System.out.println();
+    logger.info("Parsing Excell Verification Form..");
+
+
+    JsonNode requestData = new ObjectMapper().createObjectNode();
+    String verificationType = "";
+
+    if (verificationFormType.contains("technical_verification_form")) {
+      verificationType = Utils.getEnv("verification_technical");
+    } else if (verificationFormType.contains("property_verification_form")) {
+      verificationType = Utils.getEnv("verification_property");
+    } else if (verificationFormType.contains("legal_verification_form")) {
+      verificationType = Utils.getEnv("verification_legal");
+    }
+    logger.info("Verification Type : " + verificationType);
+
+    DataFormatter dataFormatter = new DataFormatter();
+
+    Workbook workbook = new XSSFWorkbook(inputStream);
+    workbook.setMissingCellPolicy(MissingCellPolicy.RETURN_BLANK_AS_NULL);
+    Sheet inputSheet = workbook.getSheetAt(0); // Only Sheet at 0th location should take
+
+    JsonNode reqData = new ObjectMapper().createObjectNode();
+    Row row = inputSheet.getRow(1);
+    int numOfCells = row.getLastCellNum();
+
+
+    for (int cellIndex = 0; cellIndex < numOfCells; cellIndex++) {
+      ((ObjectNode) reqData).put(
+          verificationType + " "
+              + dataFormatter.formatCellValue(inputSheet.getRow(0).getCell(cellIndex)),
+          dataFormatter.formatCellValue(inputSheet.getRow(1).getCell(cellIndex)));
+    }
+
+    workbook.close();
+
+    // setting media information
+    ((ObjectNode) reqData).set(verificationType + " " + "Files", typesAndSources);
+    logger.info("Data From Excell: " + reqData);
+
+    ((ObjectNode) requestData).put("verificationType", verificationType);
+    ((ObjectNode) requestData).put("verificationConfirmationReceivingDate", new Date().toString());
+    ((ObjectNode) requestData).put("loanApplicationNumber", loanApplicationNumber);
+    ((ObjectNode) requestData).put("emailFrom", emailFrom);
+    ((ObjectNode) requestData).put("mediaStorage", Utils.getEnv("file_system").toString());
+    ((ObjectNode) requestData).set("data", reqData);
+    System.out.println();
+    logger.info("Data Sending to Ops....");
+    logger.info("REQUEST DATA: " + requestData);
+
+    String status = Utils.sendParsedVerificationDataToOps(requestData);
+    System.out.println(status);
+  }
+
+
+
+}
+
+
